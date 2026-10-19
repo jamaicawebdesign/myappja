@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test lib/scanner.test.ts"
+    "test": "tsx --test lib/*.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",

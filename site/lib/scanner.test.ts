@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assessSecurityHeaders, extractSameOriginLinks, inspectHtmlResources, isAllowedByRobots, isValidSourceMap, parseRobotsRules } from "./scanner";
+import { aggregatePageChecks, assessSecurityHeaders, extractSameOriginLinks, inspectHtmlResources, isAllowedByRobots, isValidSourceMap, parseRobotsRules } from "./scanner";
 
 function checkStatus(headers: Headers, id: string) {
   return assessSecurityHeaders(headers, true).find((check) => check.id === id)?.status;
@@ -94,6 +94,29 @@ test("applies the matching robots.txt group and most-specific allow rule", () =>
   assert.equal(isAllowedByRobots(new URL("https://site.example.test/private/public"), rules), true);
   assert.equal(isAllowedByRobots(new URL("https://site.example.test/admin"), rules), false);
   assert.equal(isAllowedByRobots(new URL("https://site.example.test/about"), rules), true);
+});
+
+test("aggregates duplicate checks with the number and paths of affected pages", () => {
+  const makePage = (path: string, status: "issue" | "pass") => ({
+    url: new URL(`https://site.example.test${path}`),
+    assets: [],
+    links: [],
+    checks: [{
+      id: "csp",
+      title: "Content Security Policy",
+      detail: status === "issue" ? "Weak script policy." : "Strict policy.",
+      severity: "medium" as const,
+      status,
+      evidence: status === "issue" ? "unsafe-inline" : "strict-src",
+      recommendation: "Use a strict script policy.",
+    }],
+  });
+  const aggregated = aggregatePageChecks([makePage("/", "issue"), makePage("/account", "issue"), makePage("/about", "pass")]);
+  assert.equal(aggregated.length, 1);
+  assert.equal(aggregated[0].status, "issue");
+  assert.match(aggregated[0].detail, /2 of 3 inspected pages/);
+  assert.match(aggregated[0].evidence ?? "", /\//);
+  assert.match(aggregated[0].evidence ?? "", /\/account/);
 });
 
 test("requires a structurally valid version 3 source map", () => {

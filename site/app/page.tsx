@@ -2,11 +2,11 @@
 
 import {
   Activity, ArrowUpRight, Bell, Check, ChevronDown, ChevronRight, CircleAlert, CircleHelp,
-  Clock3, Cloud, Code2, Copy, Download, ExternalLink, FileCode2, Globe2,
+  Clock3, Cloud, Code2, Copy, CreditCard, Download, ExternalLink, FileCode2, Globe2,
   LayoutDashboard, LoaderCircle, LockKeyhole, LogOut, Menu, Plus, Search,
-  Save, Settings2, Shield, ShieldAlert, ShieldCheck, Sparkles, Trash2, X,
+  Save, Settings2, Shield, ShieldAlert, ShieldCheck, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { createBrowserSupabaseClient, isSupabaseConfigured } from "@/lib/supabase";
 
 type CheckResult = {
@@ -21,12 +21,12 @@ type CheckResult = {
 };
 type AssetResult = { url: string; kind: "script" | "stylesheet" | "source map"; status: number | null };
 type ScanResult = { id: string; targetUrl: string; scannedAt: string; score: number; checks: CheckResult[]; assets: AssetResult[] };
-type Section = "Overview" | "Scans" | "Files" | "Reports" | "Settings";
+type Section = "Overview" | "Scans" | "Files" | "Reports" | "Plans" | "Settings";
 
 const navigation: { label: Section; icon: typeof LayoutDashboard }[] = [
   { label: "Overview", icon: LayoutDashboard }, { label: "Scans", icon: Activity },
   { label: "Files", icon: FileCode2 }, { label: "Reports", icon: ShieldCheck },
-  { label: "Settings", icon: Settings2 },
+  { label: "Plans", icon: CreditCard }, { label: "Settings", icon: Settings2 },
 ];
 const severityLabel: Record<CheckResult["severity"], string> = { critical: "Critical", high: "High", medium: "Medium", low: "Low", info: "Info" };
 
@@ -37,6 +37,11 @@ function dateOf(value: string) {
   return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 function scoreTone(score: number) { return score >= 85 ? "good" : score >= 65 ? "watch" : "bad"; }
+function scanPageCount(scan: ScanResult) {
+  const detail = scan.checks.find((check) => check.id === "crawl-coverage")?.detail ?? "";
+  const match = /Inspected (\d+) of (\d+) discovered/i.exec(detail);
+  return match ? { inspected: Number(match[1]), discovered: Number(match[2]) } : { inspected: 1, discovered: 1 };
+}
 
 export default function Home() {
   const [section, setSection] = useState<Section>("Overview");
@@ -66,6 +71,8 @@ export default function Home() {
   const [accountEmail, setAccountEmail] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const savedWorkspace = window.localStorage.getItem("perimeter-workspace-name-v1");
@@ -115,6 +122,22 @@ export default function Home() {
     return () => listener.subscription.unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAccountMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [accountMenuOpen]);
+
   async function handleScan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (isScanning) return;
@@ -140,7 +163,9 @@ export default function Home() {
         setDefaultTargetDraft(url);
       }
       setSelected(scan); setSection("Overview");
-      setNotice(payload.saved ? "Scan complete. Report synced to your Supabase account." : payload.saveError ?? "Scan complete. Report saved in this browser only.");
+      const pageCount = scanPageCount(scan);
+      const crawlSummary = `Inspected ${pageCount.inspected} of ${pageCount.discovered} discovered pages.`;
+      setNotice(payload.saved ? `Scan complete. ${crawlSummary} Report synced to your Supabase account.` : `${crawlSummary} ${payload.saveError ?? "Report saved in this browser only."}`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "The scan could not be completed."); }
     finally { setIsScanning(false); }
   }
@@ -187,6 +212,7 @@ export default function Home() {
     const supabase = createBrowserSupabaseClient();
     if (!supabase) return;
     await supabase.auth.signOut(); setSignedIn(false); setAccountEmail("");
+    setAccountMenuOpen(false);
     setNotice("Signed out. Browser-local scan history remains on this device.");
   }
 
@@ -287,7 +313,7 @@ export default function Home() {
     return matchesSearch && matchesKind && matchesStatus;
   });
   const unavailableAssetCount = fileAssets.filter((asset) => asset.status === null || asset.status >= 400).length;
-  const heading = section === "Overview" ? "Security overview" : section === "Files" ? "Scanned files" : section === "Settings" ? "Workspace settings" : section === "Reports" ? "Scan reports" : "Scan history";
+  const heading = section === "Overview" ? "Security overview" : section === "Files" ? "Scanned files" : section === "Settings" ? "Workspace settings" : section === "Reports" ? "Scan reports" : section === "Plans" ? "Plans & pricing" : "Scan history";
 
   function exportAssets() {
     const escapeCell = (value: string) => `"${value.replaceAll('"', '""')}"`;
@@ -318,14 +344,14 @@ export default function Home() {
       <button className="workspace-switcher" onClick={() => setSection("Settings")}><span className="workspace-avatar">{workspaceName.slice(0, 1).toUpperCase()}</span><span className="workspace-copy"><strong>{workspaceName}</strong><small>Free workspace</small></span><ChevronDown size={15} /></button>
       <span className="nav-caption">WORKSPACE</span>
       <nav className="main-nav" aria-label="Main navigation">{navigation.map(({ label, icon: Icon }) => <button key={label} className={`nav-link ${section === label ? "nav-link-active" : ""}`} onClick={() => { setSection(label); setMobileNavOpen(false); }}><Icon size={17} /><span>{label}</span>{label === "Scans" && scans.length > 0 && <span className="nav-count">{scans.length}</span>}{label === "Reports" && latest && <span className="nav-dot" />}</button>)}</nav>
-      <div className="sidebar-bottom"><button className="sidebar-plan" onClick={() => setSection("Settings")}><span className="plan-icon"><Sparkles size={15} /></span><span><strong>Free plan</strong><small>{scans.length}/25 scans this month</small></span><ChevronRight size={15} /></button><button className="account-button" aria-label={signedIn ? `Log out ${accountEmail}` : "Log in or sign up"} onClick={() => signedIn ? void handleSignOut() : (setAuthMode("login"), setSyncOpen(true))}><span className="account-avatar">{signedIn ? accountEmail.slice(0, 1).toUpperCase() : "G"}</span><span className="account-copy"><strong>{signedIn ? accountEmail : "Guest workspace"}</strong><small>{signedIn ? "Log out" : "Log in or sign up"}</small></span>{signedIn ? <LogOut size={15} /> : <Cloud size={15} />}</button></div>
+      <div className="sidebar-bottom"><button className="sidebar-plan" onClick={() => setSection("Plans")}><span className="plan-icon"><Sparkles size={15} /></span><span><strong>Free plan</strong><small>View plans</small></span><ChevronRight size={15} /></button><button className="account-button" aria-label={signedIn ? `Account menu for ${accountEmail}` : "Log in or sign up"} onClick={() => signedIn ? (setAccountMenuOpen(false), setSection("Settings")) : (setAuthMode("login"), setSyncOpen(true))}><span className="account-avatar">{signedIn ? accountEmail.slice(0, 1).toUpperCase() : "G"}</span><span className="account-copy"><strong>{signedIn ? accountEmail : "Guest workspace"}</strong><small>{signedIn ? "Account settings" : "Log in or sign up"}</small></span>{signedIn ? <UserRound size={15} /> : <Cloud size={15} />}</button></div>
     </aside>
     {mobileNavOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
 
     <main className="main-area" id="overview">
-      <header className="topbar"><button className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNavOpen(true)}><Menu size={19} /></button><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{section}</strong></div><div className="top-actions"><span className="environment-pill"><span /> MONITORING ACTIVE</span><button className="icon-button" aria-label="Help center" title="Help center"><CircleHelp size={18} /></button><button className="icon-button" aria-label="Notifications" title="Notifications"><Bell size={18} /></button><button className="top-avatar" aria-label="Account settings" onClick={() => setSyncOpen(true)}>N</button></div></header>
+      <header className="topbar"><button className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNavOpen(true)}><Menu size={19} /></button><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><strong>{section}</strong></div><div className="top-actions"><span className="environment-pill"><span /> MONITORING ACTIVE</span><button className="icon-button" aria-label="Help center" title="Help center"><CircleHelp size={18} /></button><button className="icon-button" aria-label="Notifications" title="Notifications"><Bell size={18} /></button><div className="account-menu-wrap" ref={accountMenuRef}><button className="top-avatar" aria-label="Open account menu" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((open) => !open)}>{signedIn ? accountEmail.slice(0, 1).toUpperCase() : workspaceName.slice(0, 1).toUpperCase()}</button>{accountMenuOpen && <div className="account-dropdown" role="menu"><div className="account-dropdown-head"><span className="account-avatar">{signedIn ? accountEmail.slice(0, 1).toUpperCase() : workspaceName.slice(0, 1).toUpperCase()}</span><span><strong>{signedIn ? accountEmail : workspaceName}</strong><small>{signedIn ? "Signed in" : "Guest workspace"}</small></span></div><div className="account-dropdown-divider" />{signedIn && <button role="menuitem" onClick={() => { setSection("Settings"); setAccountMenuOpen(false); }}><UserRound size={16} /> Account settings</button>}<button role="menuitem" onClick={() => { setSection("Plans"); setAccountMenuOpen(false); }}><CreditCard size={16} /> Plans & pricing</button><button role="menuitem" onClick={() => { setSection("Settings"); setAccountMenuOpen(false); }}><Settings2 size={16} /> Workspace settings</button><div className="account-dropdown-divider" />{signedIn ? <button role="menuitem" className="account-logout" onClick={() => void handleSignOut()}><LogOut size={16} /> Log out</button> : <button role="menuitem" onClick={() => { setAuthMode("login"); setSyncOpen(true); setAccountMenuOpen(false); }}><Cloud size={16} /> Log in or sign up</button>}</div>}</div></div></header>
       <div className="content-wrap">
-        <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> WEBSITE SECURITY</div><h1>{heading}<span className="heading-period">.</span></h1><p>{section === "Overview" ? "A clear view of what’s exposed, what’s protected, and what needs attention." : section === "Files" ? "Public scripts and stylesheets discovered during your latest scan." : section === "Settings" ? "Manage scan defaults and report storage." : section === "Reports" ? "Review security findings and score trends across your sites." : "Every manual check, collected in one place."}</p></div><button className="quiet-button" onClick={() => setSyncOpen(true)}><Cloud size={16} />{signedIn ? "Cloud synced" : "Connect cloud"}</button></div>
+        <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> WEBSITE SECURITY</div><h1>{heading}<span className="heading-period">.</span></h1><p>{section === "Overview" ? "A clear view of what’s exposed, what’s protected, and what needs attention." : section === "Files" ? "Public scripts and stylesheets discovered during your latest scan." : section === "Settings" ? "Manage scan defaults and report storage." : section === "Reports" ? "Review security findings and score trends across your sites." : section === "Plans" ? "Current access and proposed upgrades. Checkout is not connected yet." : "Every manual check, collected in one place."}</p></div><button className="quiet-button" onClick={() => setSyncOpen(true)}><Cloud size={16} />{signedIn ? "Cloud synced" : "Connect cloud"}</button></div>
 
         {section === "Overview" && <>
           <section className="metrics-row" aria-label="Security metrics">
@@ -335,7 +361,7 @@ export default function Home() {
             <article className="metric-card"><div className="metric-top"><span>FILES INSPECTED</span><span className="metric-icon lilac"><Code2 size={17} /></span></div><div className="metric-value">{scans.reduce((sum, scan) => sum + scan.assets.length, 0)}<span className="metric-suffix">assets</span></div><div className="metric-foot">Scripts, stylesheets & source maps</div></article>
           </section>
 
-          <section className="scan-panel"><div className="scan-panel-copy"><div className="panel-label"><span className="pulse-dot" /> ON-DEMAND SCAN</div><h2>Check your perimeter.</h2><p>Inspect a public website’s security headers, external scripts, and exposed source maps.</p></div><form className="scan-form" onSubmit={handleScan}><label className="scan-input-wrap"><Globe2 size={17} /><input aria-label="Website URL to scan" type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://yourwebsite.com" required /><span className="input-lock"><LockKeyhole size={14} /> PUBLIC URL</span></label><button className="scan-button" type="submit" disabled={isScanning}>{isScanning ? <><LoaderCircle size={16} className="spin" /> Scanning</> : <><Plus size={17} /> Run scan</>}</button></form><div className="scan-note"><LockKeyhole size={13} /> Only public pages and same-origin assets are checked. No intrusive tests.</div></section>
+          <section className="scan-panel"><div className="scan-panel-copy"><div className="panel-label"><span className="pulse-dot" /> ON-DEMAND SITE CRAWL</div><h2>Check your perimeter.</h2><p>Crawl up to 20 linked pages, then inspect headers, resources, and public source maps.</p></div><form className="scan-form" onSubmit={handleScan}><label className="scan-input-wrap"><Globe2 size={17} /><input aria-label="Website URL to scan" type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://yourwebsite.com" required /><span className="input-lock"><LockKeyhole size={14} /> PUBLIC URL</span></label><button className="scan-button" type="submit" disabled={isScanning}>{isScanning ? <><LoaderCircle size={16} className="spin" /> Scanning</> : <><Plus size={17} /> Run scan</>}</button></form><div className="scan-note"><LockKeyhole size={13} /> Same-origin GET requests only. Respects robots.txt; capped at 20 pages and 30 seconds.</div></section>
 
           {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="Dismiss notice" onClick={() => setNotice("")}><X size={15} /></button></div>}
           <div className="section-grid"><section className="surface latest-surface"><div className="surface-heading"><div><span className="surface-kicker">LATEST ACTIVITY</span><h2>Recent scans</h2></div><button className="text-button" onClick={() => setSection("Scans")}>All scans <ChevronRight size={15} /></button></div>{scans.length ? <div className="scan-table-wrap"><table className="scan-table"><thead><tr><th>WEBSITE</th><th>LAST SCAN</th><th>RESULT</th><th /></tr></thead><tbody>{scans.slice(0, 5).map((scan) => <tr key={scan.id} onClick={() => setSelected(scan)}><td><span className="site-favicon"><Globe2 size={15} /></span><span className="site-name"><strong>{hostOf(scan.targetUrl)}</strong><small>{new URL(scan.targetUrl).protocol.replace(":", "")}</small></span></td><td className="date-cell">{dateOf(scan.scannedAt)}</td><td><span className={`score-badge ${scoreTone(scan.score)}`}>{scan.score}<small>/100</small></span></td><td><ChevronRight size={16} className="row-arrow" /></td></tr>)}</tbody></table></div> : <div className="empty-activity"><div className="empty-icon"><Globe2 size={19} /></div><div><strong>Your scan history starts here</strong><span>Enter a public website above to create your first report.</span></div><button className="text-button" onClick={() => document.querySelector<HTMLInputElement>(".scan-input-wrap input")?.focus()}>Start a scan <ChevronRight size={15} /></button></div>}</section>
@@ -386,6 +412,34 @@ export default function Home() {
 
         {section === "Reports" && <section className="report-layout">{latest ? <><div className="report-hero surface"><div className="report-score-wrap"><div className={`report-score ${scoreTone(latest.score)}`}><strong>{latest.score}</strong><small>OUT OF 100</small></div><div><span className="surface-kicker">HEURISTIC BASELINE</span><h2>{hostOf(latest.targetUrl)}</h2><p>Scanned {dateOf(latest.scannedAt)}</p></div></div><button className="quiet-button" onClick={() => { const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([JSON.stringify(latest, null, 2)], { type: "application/json" })); link.download = `${hostOf(latest.targetUrl)}-security-report.json`; link.click(); URL.revokeObjectURL(link.href); }}><Download size={15} /> Export JSON</button></div><div className="report-summary"><div><span className="summary-mark summary-issue"><ShieldAlert size={17} /></span><strong>{latest.checks.filter((item) => item.status === "issue").length}</strong><small>Findings</small></div><div><span className="summary-mark summary-pass"><ShieldCheck size={17} /></span><strong>{latest.checks.filter((item) => item.status === "pass").length}</strong><small>Passed checks</small></div><div><span className="summary-mark summary-info"><FileCode2 size={17} /></span><strong>{latest.assets.length}</strong><small>Files checked</small></div></div><section className="surface report-checks"><div className="surface-heading"><div><span className="surface-kicker">TECHNICAL RESULTS</span><h2>Security checks</h2></div><span className="report-total">{latest.checks.length} total</span></div><div className="findings-list">{latest.checks.map((item) => <FindingRow key={item.id} item={item} detailed />)}</div></section><div className="report-disclaimer"><CircleHelp size={15} /> Passive baseline checks only. Results are heuristic, not a certification, penetration test, or guarantee of security.</div></> : <section className="surface page-surface"><EmptyState icon={<ShieldCheck size={20} />} title="Your reports will appear here" detail="Run a scan to see its score, checks, and file findings." action={() => setSection("Overview")} /></section>}</section>}
 
+        {section === "Plans" && <section className="plans-page">
+          <div className="plans-status"><CreditCard size={18} /><span><strong>Billing isn’t connected yet</strong><small>Free is available now. Paid prices and benefits below are proposed and can’t be purchased yet.</small></span></div>
+          <div className="plan-grid">
+            <article className="plan-card plan-card-current">
+              <div className="plan-card-top"><span className="plan-name">Free</span><span className="plan-badge current-badge">CURRENT</span></div>
+              <p className="plan-description">Try the passive baseline scanner.</p>
+              <div className="plan-price"><strong>$0</strong><span> / forever</span></div>
+              <ul><li><Check size={15} /> Same-origin crawl, up to 20 pages</li><li><Check size={15} /> Header and resource checks</li><li><Check size={15} /> Browser reports and JSON export</li><li><Check size={15} /> Supabase history when signed in</li></ul>
+              <button className="plan-button plan-button-current" disabled>Current plan</button>
+            </article>
+            <article className="plan-card plan-card-proposed">
+              <div className="plan-card-top"><span className="plan-name">Pro</span><span className="plan-badge proposed-badge">PROPOSED</span></div>
+              <p className="plan-description">For independent site owners.</p>
+              <div className="plan-price"><strong>$12</strong><span> / site / month</span></div>
+              <ul><li><Check size={15} /> Everything in Free</li><li><Check size={15} /> Higher scan allowance <small>planned</small></li><li><Check size={15} /> Longer report history <small>planned</small></li><li><Check size={15} /> Priority support <small>planned</small></li></ul>
+              <button className="plan-button" disabled title="Billing is not configured">Available when billing is connected</button>
+            </article>
+            <article className="plan-card">
+              <div className="plan-card-top"><span className="plan-name">Agency</span><span className="plan-badge proposed-badge">PROPOSED</span></div>
+              <p className="plan-description">For teams managing client sites.</p>
+              <div className="plan-price"><strong>$39</strong><span> / month</span></div>
+              <ul><li><Check size={15} /> Multiple client sites <small>planned</small></li><li><Check size={15} /> Shared team workspaces <small>planned</small></li><li><Check size={15} /> Client-ready exports <small>planned</small></li><li><Check size={15} /> Team access controls <small>planned</small></li></ul>
+              <button className="plan-button" disabled title="Billing is not configured">Available when billing is connected</button>
+            </article>
+          </div>
+          <p className="plans-footnote">Proposed pricing is for feedback only. Paid features, plan quotas, payment processing, and subscription management are not implemented.</p>
+        </section>}
+
         {section === "Settings" && <div className="settings-page">
           <form className="surface settings-card" onSubmit={handleSaveSettings}>
             <div className="settings-card-heading"><span className="surface-kicker">WORKSPACE</span><h2>Workspace preferences</h2><p>Keep a familiar name and scan target on this device.</p></div>
@@ -408,11 +462,12 @@ export default function Home() {
 
           <section className="surface settings-card settings-safety-card">
             <div className="settings-card-heading"><span className="surface-kicker">SCANNER SAFETY</span><h2>Read-only checks</h2><p>Scanner protections are always enabled and cannot be disabled in this workspace.</p></div>
-            <div className="safety-grid"><div><span className="settings-check"><Check size={15} /></span><span><strong>Public websites only</strong><small>Localhost and private IP ranges are blocked.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>Same-host redirects</strong><small>Redirects cannot switch to another host.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>Bounded requests</strong><small>Response size, file count, and request time are capped.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>No intrusive tests</strong><small>No payloads, form submissions, or access bypass attempts.</small></span></div></div>
+            <div className="safety-grid"><div><span className="settings-check"><Check size={15} /></span><span><strong>Public websites only</strong><small>Localhost and private IP ranges are blocked.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>Same-origin crawl</strong><small>Same-origin links only; respects robots.txt.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>Bounded requests</strong><small>20 pages, 30 seconds, 40 assets per scan.</small></span></div><div><span className="settings-check"><Check size={15} /></span><span><strong>No intrusive tests</strong><small>No payloads, form submissions, or access bypass attempts.</small></span></div></div>
+            <p className="settings-rate-copy">Abuse limits: 5 scans per client per 10 minutes, 60 scans per running instance per 10 minutes, and 2 concurrent scans per client. Limits reset when a server instance restarts; multi-instance deployments should use a shared rate-limit store.</p>
           </section>
         </div>}
 
-        <footer className="page-footer"><span><span className="footer-shield"><ShieldCheck size={14} /></span> Built for safer launches.</span><span>PERIMETER SECURITY SCANNER <span className="footer-dot">·</span> v1.0</span></footer>
+        <footer className="page-footer"><span><span className="footer-shield"><ShieldCheck size={14} /></span> Built for safer launches.</span><span className="footer-links"><a href="/terms">Terms</a><a href="/privacy">Privacy</a><span>PERIMETER SECURITY SCANNER <span className="footer-dot">·</span> v1.0</span></span></footer>
       </div>
     </main>
 

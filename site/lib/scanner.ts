@@ -25,6 +25,7 @@ const REQUEST_TIMEOUT_MS = 6000;
 const MAX_CRAWL_PAGES = 20;
 const MAX_CRAWL_DURATION_MS = 30_000;
 const MAX_SITE_ASSETS = 40;
+const MAX_DISCOVERED_PAGES = 200;
 
 function isPrivateAddress(address: string) {
   if (isIP(address) === 4) {
@@ -325,57 +326,171 @@ export function isValidSourceMap(body: string) {
   catch { return false; }
 }
 
+type PageInspection = { url: URL; checks: Finding[]; assets: ScannedAsset[]; links: string[] };
+
+async function inspectPage(target: URL, allowedHost: string, origin: string, deadline: number, assetBudget: number, prefetched?: Awaited<ReturnType<typeof fetchPublic>>): Promise<PageInspection> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) throw new Error("The crawl time limit was reached.");
+  const { response, body, finalUrl } = prefetched ?? await fetchPublic(target, allowedHost, MAX_BODY_BYTES, remainingMs);
+  if (finalUrl.origin !== origin) throw new Error("Crawl redirects must remain on the original origin.");
+  const checks: Finding[] = [];
+  const assets: ScannedAsset[] = [];
+  if (!response.ok) {
+    addCheck(checks, "page-response", "Page response", `The discovered page returned HTTP ${response.status}; its security headers could not be assessed.`, "info", "info", undefined, `HTTP ${response.status}`);
+    return { url: finalUrl, checks, assets, links: [] };
+  }
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+    addCheck(checks, "page-response", "Page response", "The discovered URL did not return HTML, so page checks were skipped.", "info", "info", undefined, contentType || "Content-Type absent");
+    return { url: finalUrl, checks, assets, links: [] };
+  }
+
+  const secureTransport = finalUrl.protocol === "https:";
+  addCheck(checks, "http-status", "HTTP response", `The page returned HTTP ${response.status}.`, "info", "pass", undefined, `${finalUrl.pathname}: HTTP ${response.status}; ${contentType}`);
+  addCheck(checks, "https", "HTTPS transport", secureTransport ? "The page was reached over HTTPS." : "The page is served over HTTP. Use HTTPS to protect visitors and session data.", "high", secureTransport ? "pass" : "issue", finalUrl.origin, `${finalUrl.pathname}: ${finalUrl.protocol}`, "Serve the site over HTTPS and redirect HTTP requests.");
+  checks.push(...assessSecurityHeaders(response.headers, secureTransport));
+  const inspection = inspectHtmlResources(body, finalUrl.href);
+  addCheck(checks, "mixed-content", "Mixed-content references", inspection.mixedContentUrls.length ? `${inspection.mixedContentUrls.length} HTTP resource reference${inspection.mixedContentUrls.length === 1 ? " was" : "s were"} found in parsed HTML elements.` : "No HTTP resource URLs were found in parsed HTML resource attributes.", "high", inspection.mixedContentUrls.length ? "issue" : "pass", undefined, `${finalUrl.pathname}: ${inspection.mixedContentUrls.slice(0, 3).join(", ") || "No mixed-content references"}`, "Update referenced resources to HTTPS or remove them.");
+  addCheck(checks, "sri", "Third-party resource integrity", inspection.thirdPartyWithoutIntegrity.length ? `${inspection.thirdPartyWithoutIntegrity.length} cross-origin script or stylesheet${inspection.thirdPartyWithoutIntegrity.length === 1 ? " is" : "s are"} missing Subresource Integrity.` : "No cross-origin script or stylesheet without integrity was found.", "medium", inspection.thirdPartyWithoutIntegrity.length ? "issue" : "pass", "script/link integrity", `${finalUrl.pathname}: ${inspection.thirdPartyWithoutIntegrity.slice(0, 3).join(", ") || "No unpinned third-party resources"}`, "Use Subresource Integrity for static cross-origin scripts and stylesheets where supported.");
+
+  let inspectedFiles = 0;
+  let exposedMaps = 0;
+  let assetRequests = 0;
+  const checkedMaps = new Set<string>();
+  for (const asset of inspection.assetTargets.slice(0, Math.min(assetBudget, MAX_ASSETS))) {
+    if (Date.now() >= deadline || assetRequests >= assetBudget) break;
+    assetRequests += 1;
+    try {
+      const assetUrl = new URL(asset.url);
+      const result = await fetchPublic(assetUrl, allowedHost, 300_000, deadline - Date.now());
+      if (result.finalUrl.origin !== origin) throw new Error("Asset redirects must remain on the original origin.");
+      assets.push({ url: assetUrl.href, kind: asset.kind, status: result.response.status });
+      inspectedFiles += 1;
+      if (asset.kind !== "script") continue;
+      const mapReference = result.body.match(/[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)/);
+      if (!mapReference || checkedMaps.size >= 4 || assetRequests >= assetBudget) continue;
+      const mapUrl = new URL(mapReference[1], result.finalUrl);
+      if (mapUrl.origin !== origin || checkedMaps.has(mapUrl.href)) continue;
+      checkedMaps.add(mapUrl.href);
+      assetRequests += 1;
+      try {
+        const map = await fetchPublic(mapUrl, allowedHost, 300_000, deadline - Date.now());
+        if (map.finalUrl.origin !== origin) throw new Error("Source-map redirects must remain on the original origin.");
+        assets.push({ url: mapUrl.href, kind: "source map", status: map.response.status });
+        if (map.response.ok && isValidSourceMap(map.body)) exposedMaps += 1;
+      } catch { assets.push({ url: mapUrl.href, kind: "source map", status: null }); }
+    } catch { assets.push({ url: asset.url, kind: asset.kind, status: null }); }
+  }
+  addCheck(checks, "source-maps", "Public source maps", exposedMaps ? `${exposedMaps} valid version 3 source map${exposedMaps === 1 ? " is" : "s are"} publicly accessible.` : checkedMaps.size ? "Referenced source-map URLs were checked, but no valid source-map document was confirmed." : "No same-origin source-map reference was found in inspected scripts.", "medium", exposedMaps ? "issue" : "pass", "version 3 source map JSON", `${finalUrl.pathname}: ${exposedMaps ? `${exposedMaps} valid public map${exposedMaps === 1 ? "" : "s"}` : "No valid public source map"}`, "Avoid publishing source maps with original sources to public production paths.");
+  addCheck(checks, "asset-coverage", "Same-origin assets inspected", inspectedFiles ? `${inspectedFiles} same-origin script or stylesheet${inspectedFiles === 1 ? " was" : "s were"} fetched within the scan limits.` : "No same-origin script or stylesheet was discovered in the page markup.", "info", "info", undefined, `${finalUrl.pathname}: ${inspection.assetTargets.length} referenced; ${inspectedFiles} fetched`);
+  return { url: finalUrl, checks, assets, links: extractSameOriginLinks(body, finalUrl.href, origin) };
+}
+
+export function aggregatePageChecks(pages: PageInspection[]) {
+  const grouped = new Map<string, Finding[]>();
+  for (const page of pages) {
+    const path = `${page.url.pathname}${page.url.search}`;
+    for (const check of page.checks) {
+      const finding = { ...check, evidence: `${path}: ${check.evidence ?? check.detail}` };
+      const group = grouped.get(check.id) ?? [];
+      group.push(finding);
+      grouped.set(check.id, group);
+    }
+  }
+  return [...grouped.entries()].map(([id, findings]) => {
+    const issueFindings = findings.filter((finding) => finding.status === "issue");
+    const worstStatus = issueFindings.length ? "issue" : findings.some((finding) => finding.status === "info") ? "info" : "pass";
+    const severityOrder: Finding["severity"][] = ["info", "low", "medium", "high", "critical"];
+    const severity = findings.reduce((highest, finding) => severityOrder.indexOf(finding.severity) > severityOrder.indexOf(highest) ? finding.severity : highest, "info" as Finding["severity"]);
+    const uniqueDetails = [...new Set((issueFindings.length ? issueFindings : findings).map((finding) => finding.detail))];
+    const affectedPaths = [...new Set((issueFindings.length ? issueFindings : findings).map((finding) => finding.evidence?.split(": ")[0] ?? "/"))];
+    return {
+      ...findings[0],
+      status: worstStatus,
+      severity,
+      detail: issueFindings.length ? `${issueFindings.length} of ${findings.length} inspected pages flagged this check. ${uniqueDetails.slice(0, 2).join(" ")}` : uniqueDetails[0],
+      evidence: (issueFindings.length ? issueFindings : findings).slice(0, 8).map((finding) => finding.evidence).join("; "),
+      resource: id === "https" ? `${affectedPaths.length} page${affectedPaths.length === 1 ? "" : "s"} checked` : findings[0].resource,
+    } satisfies Finding;
+  });
+}
+
 export async function scanWebsite(input: string): Promise<ScanReport> {
   let requested: URL;
   try { requested = new URL(input); } catch { throw new Error("Enter a valid website URL, including its domain."); }
   requested.hash = "";
   if (!requested.hostname) throw new Error("Enter a valid website URL.");
   const allowedHost = requested.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  const { response, body, finalUrl } = await fetchPublic(requested, allowedHost);
-  if (!response.ok) throw new Error(`The website returned HTTP ${response.status}; security checks were not scored for an unsuccessful response.`);
-  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+  const deadline = Date.now() + MAX_CRAWL_DURATION_MS;
+  const root = await fetchPublic(requested, allowedHost, MAX_BODY_BYTES, MAX_CRAWL_DURATION_MS);
+  if (!root.response.ok) throw new Error(`The website returned HTTP ${root.response.status}; security checks were not scored for an unsuccessful response.`);
+  const rootContentType = root.response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!rootContentType.includes("text/html") && !rootContentType.includes("application/xhtml+xml")) {
     throw new Error("The URL did not return an HTML document, so page security checks could not be validated.");
   }
-  const headers = response.headers;
-  const checks: Finding[] = [];
+  const origin = root.finalUrl.origin;
+  const robotsUrl = new URL("/robots.txt", origin);
+  let robotsRules: RobotsRule[] = [];
+  let robotsStatus: "available" | "not-found" | "unavailable" = "unavailable";
+  try {
+    if (Date.now() < deadline) {
+      const robots = await fetchPublic(robotsUrl, allowedHost, 100_000, Math.min(2500, deadline - Date.now()));
+      if (robots.response.ok) {
+        robotsRules = parseRobotsRules(robots.body);
+        robotsStatus = "available";
+      } else if (robots.response.status === 404 || robots.response.status === 410) {
+        robotsStatus = "not-found";
+      }
+    }
+  } catch { robotsRules = []; }
+  if (!isAllowedByRobots(root.finalUrl, robotsRules)) throw new Error("The site's robots.txt disallows scanning the requested path.");
+  if (Date.now() >= deadline) throw new Error("The crawl time limit was reached before the first page could be inspected.");
+
+  const queue: URL[] = [root.finalUrl];
+  const discovered = new Set<string>([root.finalUrl.href]);
+  const visited = new Set<string>();
+  const pages: PageInspection[] = [];
   const assets: ScannedAsset[] = [];
-  const secureTransport = finalUrl.protocol === "https:";
-  addCheck(checks, "http-status", "HTTP response", `The target returned HTTP ${response.status}.`, "info", "pass", finalUrl.href, `HTTP ${response.status}; ${contentType}`);
-  addCheck(checks, "https", "HTTPS transport", secureTransport ? "The page was reached over HTTPS." : "The final page is served over HTTP. Use HTTPS to protect visitors and session data.", "high", secureTransport ? "pass" : "issue", finalUrl.origin, finalUrl.protocol, "Serve the site over HTTPS and redirect HTTP requests.");
-  checks.push(...assessSecurityHeaders(headers, secureTransport));
+  let inspectedAssetCount = 0;
+  let failedPages = 0;
+  let robotsSkipped = 0;
+  let crawlLimitReached = false;
 
-  const inspection = inspectHtmlResources(body, finalUrl.href);
-  const mixedContentUrls = inspection.mixedContentUrls;
-  addCheck(checks, "mixed-content", "Mixed-content references", mixedContentUrls.length ? `${mixedContentUrls.length} HTTP resource reference${mixedContentUrls.length === 1 ? " was" : "s were"} found in parsed HTML elements on an HTTPS page.` : "No HTTP resource URLs were found in parsed HTML resource attributes.", "high", mixedContentUrls.length ? "issue" : "pass", undefined, mixedContentUrls.slice(0, 3).join(", ") || "No mixed-content references", "Update referenced resources to HTTPS or remove them.");
-  addCheck(checks, "sri", "Third-party resource integrity", inspection.thirdPartyWithoutIntegrity.length ? `${inspection.thirdPartyWithoutIntegrity.length} cross-origin script or stylesheet${inspection.thirdPartyWithoutIntegrity.length === 1 ? " is" : "s are"} missing Subresource Integrity.` : "No cross-origin script or stylesheet without integrity was found.", "medium", inspection.thirdPartyWithoutIntegrity.length ? "issue" : "pass", "script/link integrity", inspection.thirdPartyWithoutIntegrity.slice(0, 3).join(", ") || "No unpinned third-party resources", "Use Subresource Integrity for static cross-origin scripts and stylesheets where supported.");
-
-  let inspectedFiles = 0;
-  let exposedMaps = 0;
-  const checkedMaps = new Set<string>();
-  for (const asset of inspection.assetTargets) {
+  while (queue.length && pages.length < MAX_CRAWL_PAGES && Date.now() < deadline && inspectedAssetCount < MAX_SITE_ASSETS) {
+    const next = queue.shift() as URL;
+    if (visited.has(next.href)) continue;
+    visited.add(next.href);
+    if (!isAllowedByRobots(next, robotsRules)) {
+      robotsSkipped += 1;
+      continue;
+    }
     try {
-      const assetUrl = new URL(asset.url);
-      const result = await fetchPublic(assetUrl, allowedHost, 300_000);
-      assets.push({ url: assetUrl.href, kind: asset.kind, status: result.response.status });
-      inspectedFiles += 1;
-      if (asset.kind !== "script") continue;
-      const mapReference = result.body.match(/[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)/);
-      if (!mapReference || checkedMaps.size >= 4) continue;
-      const mapUrl = new URL(mapReference[1], result.finalUrl);
-      if (mapUrl.origin !== finalUrl.origin || checkedMaps.has(mapUrl.href)) continue;
-      checkedMaps.add(mapUrl.href);
-      try {
-        const map = await fetchPublic(mapUrl, allowedHost, 300_000);
-        assets.push({ url: mapUrl.href, kind: "source map", status: map.response.status });
-        if (map.response.ok && isValidSourceMap(map.body)) exposedMaps += 1;
-      } catch { assets.push({ url: mapUrl.href, kind: "source map", status: null }); }
-    } catch { assets.push({ url: asset.url, kind: asset.kind, status: null }); }
+      const page = await inspectPage(next, allowedHost, origin, deadline, MAX_SITE_ASSETS - inspectedAssetCount, next.href === root.finalUrl.href ? root : undefined);
+      pages.push(page);
+      assets.push(...page.assets);
+      inspectedAssetCount += page.assets.length;
+      for (const link of page.links) {
+        if (discovered.size >= MAX_DISCOVERED_PAGES) break;
+        const candidate = new URL(link);
+        if (candidate.origin !== origin || discovered.has(candidate.href)) continue;
+        discovered.add(candidate.href);
+        if (robotsStatus === "unavailable" || !isAllowedByRobots(candidate, robotsRules)) {
+          robotsSkipped += 1;
+          continue;
+        }
+        queue.push(candidate);
+      }
+    } catch {
+      failedPages += 1;
+    }
   }
-  addCheck(checks, "source-maps", "Public source maps", exposedMaps ? `${exposedMaps} valid version 3 source map${exposedMaps === 1 ? " is" : "s are"} publicly accessible.` : checkedMaps.size ? "Referenced source-map URLs were checked, but no valid source-map document was confirmed." : "No same-origin source-map reference was found in inspected scripts.", "medium", exposedMaps ? "issue" : "pass", "version 3 source map JSON", exposedMaps ? `${exposedMaps} structurally valid public map${exposedMaps === 1 ? "" : "s"}` : "No valid public source map", "Avoid publishing source maps with original sources to public production paths.");
-  addCheck(checks, "asset-coverage", "Same-origin assets inspected", inspectedFiles ? `${inspectedFiles} same-origin script or stylesheet${inspectedFiles === 1 ? " was" : "s were"} fetched within the scan limits.` : "No same-origin script or stylesheet was discovered in the page markup.", "info", "info", "Same-origin asset inventory", `${inspection.assetTargets.length} same-origin asset references found; ${inspectedFiles} fetched`);
 
+  crawlLimitReached = queue.length > 0 && (pages.length >= MAX_CRAWL_PAGES || Date.now() >= deadline || inspectedAssetCount >= MAX_SITE_ASSETS || discovered.size >= MAX_DISCOVERED_PAGES);
+  const checks = aggregatePageChecks(pages);
+  const pagesDiscovered = discovered.size;
+  addCheck(checks, "crawl-coverage", "Same-origin crawl coverage", `Inspected ${pages.length} of ${pagesDiscovered} discovered same-origin pages.`, "info", "info", origin, `robots.txt ${robotsStatus}; ${robotsSkipped} excluded/unexpanded links; ${failedPages} page fetch failures; ${crawlLimitReached ? "crawl stopped at a safety limit" : "queue completed"}`);
   const weights: Record<Finding["severity"], number> = { critical: 25, high: 14, medium: 8, low: 3, info: 0 };
   const deductions = checks.filter((check) => check.status === "issue").reduce((sum, check) => sum + weights[check.severity], 0);
-  return { id: crypto.randomUUID(), targetUrl: finalUrl.href, scannedAt: new Date().toISOString(), score: Math.max(0, 100 - deductions), checks, assets };
+  const uniqueAssets = [...new Map(assets.map((asset) => [`${asset.kind}:${asset.url}`, asset])).values()];
+  return { id: crypto.randomUUID(), targetUrl: root.finalUrl.href, scannedAt: new Date().toISOString(), score: Math.max(0, 100 - deductions), checks, assets: uniqueAssets };
 }
